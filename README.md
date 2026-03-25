@@ -4,6 +4,8 @@
 
 One command. Two frontier models. A synthesized `COMMITTEE_REVIEW.md` dropped into your repo.
 
+> **Platform note:** Works on **macOS**, **Linux**, and **Windows (WSL only)**. PowerShell and CMD are **not supported** -- use [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) on Windows.
+
 ---
 
 ## Why a Committee?
@@ -48,6 +50,7 @@ Both models run **in parallel** via Python's `ThreadPoolExecutor`. The script co
 | **Gemini CLI** | `npm install -g @google/gemini-cli` | Gemini-3.1-Pro code review |
 | **Python 3.9+** | System or conda | Runs the orchestration script |
 | **Node.js 18+** | [nodejs.org](https://nodejs.org) | Required by Codex & Gemini CLIs |
+| **Unix shell** | macOS / Linux / WSL | **Not compatible with PowerShell or CMD** |
 
 Make sure both `codex` and `gemini` are authenticated before first use:
 ```bash
