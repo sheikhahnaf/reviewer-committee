@@ -150,9 +150,8 @@ def run_codex_review(mode: str, param: str, file_content: str = "", project_dir:
 def run_gemini_review(diff_content: str, project_dir: str = ".") -> tuple[str, str]:
     """Run gemini review with diff piped via stdin. Returns (output, error_msg).
 
-    Uses --approval-mode plan (read-only): Gemini can read project files for context
-    (CLAUDE.md, README, source) but cannot edit or execute anything. The cwd is set to
-    project_dir so Gemini reads the correct repo's context, not the caller's directory.
+    Uses --sandbox for isolation. The cwd is set to project_dir so Gemini reads
+    the correct repo's context, not the caller's directory.
     """
     if not diff_content.strip():
         return "", "No diff content to review."
@@ -163,8 +162,7 @@ def run_gemini_review(diff_content: str, project_dir: str = ".") -> tuple[str, s
                 "gemini",
                 "-m", "gemini-3.1-pro-preview",
                 "-p", GEMINI_REVIEW_PROMPT,
-                "--approval-mode", "plan",   # read-only: cannot edit or execute
-                "--sandbox",                 # additional sandbox isolation
+                "--sandbox",                 # sandbox isolation
                 "--output-format", "text",
             ],
             input=diff_content,
