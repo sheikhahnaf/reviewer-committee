@@ -2,8 +2,9 @@
 """
 Committee Review Runner
 
-Runs Codex (gpt-5.4) and Gemini (gemini-3.1-pro-preview) code reviews in parallel
-and writes COMMITTEE_REVIEW.md to the output directory.
+Runs Codex (gpt-5.4) and Gemini (cascade: 3.1-pro-preview → 3-flash-preview →
+2.5-pro → 2.5-flash → 2.5-flash-lite) code reviews in parallel and writes
+COMMITTEE_REVIEW.md to the output directory.
 
 Usage:
     python run_committee_review.py [--mode uncommitted|base|commit|files]
@@ -147,41 +148,75 @@ def run_codex_review(mode: str, param: str, file_content: str = "", project_dir:
         return "", str(e)
 
 
-def run_gemini_review(diff_content: str, project_dir: str = ".") -> tuple[str, str]:
-    """Run gemini review with diff piped via stdin. Returns (output, error_msg).
+GEMINI_MODELS = [
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
 
-    Uses --sandbox for isolation. The cwd is set to project_dir so Gemini reads
-    the correct repo's context, not the caller's directory.
+
+def run_gemini_review(diff_content: str, project_dir: str = ".") -> tuple[str, str, str, list[str]]:
+    """Run gemini review with model cascade fallback.
+
+    Returns (output, error_msg, model_used, rejected_models).
+    Tries models in order, falling back on rate limit (429) or model-not-found (404).
+    Uses --approval-mode plan (read-only) and --sandbox for isolation.
     """
     if not diff_content.strip():
-        return "", "No diff content to review."
+        return "", "No diff content to review.", "", []
 
-    try:
-        result = subprocess.run(
-            [
-                "gemini",
-                "-m", "gemini-3.1-pro-preview",
-                "-p", GEMINI_REVIEW_PROMPT,
-                "--approval-mode", "plan",   # read-only: cannot edit or execute
-                "--sandbox",                 # additional sandbox isolation
-                "--output-format", "text",
-            ],
-            input=diff_content,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            cwd=project_dir,
-        )
-        output = result.stdout.strip()
-        if result.returncode != 0 and not output:
-            return "", result.stderr.strip() or f"Exit code {result.returncode}"
-        return output, ""
-    except subprocess.TimeoutExpired:
-        return "", "Gemini review timed out after 10 minutes. Try a smaller set of files."
-    except FileNotFoundError:
-        return "", "gemini CLI not found. Install via: npm install -g @google/gemini-cli"
-    except Exception as e:
-        return "", str(e)
+    rejected = []
+    last_error = ""
+
+    for model in GEMINI_MODELS:
+        try:
+            result = subprocess.run(
+                [
+                    "gemini",
+                    "-m", model,
+                    "-p", GEMINI_REVIEW_PROMPT,
+                    "--approval-mode", "plan",
+                    "--sandbox",
+                    "--output-format", "text",
+                ],
+                input=diff_content,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                cwd=project_dir,
+            )
+            output = result.stdout.strip()
+            stderr = result.stderr.strip()
+
+            is_retriable = any(s in stderr for s in [
+                "429", "RESOURCE_EXHAUSTED", "MODEL_CAPACITY_EXHAUSTED",
+                "404", "ModelNotFoundError", "not found",
+            ])
+
+            if result.returncode != 0 and not output and is_retriable:
+                reason = "rate-limited" if "429" in stderr else "not available"
+                rejected.append(f"{model} ({reason})")
+                last_error = stderr or f"Exit code {result.returncode}"
+                print(f"  Gemini: {model} {reason}, falling back...")
+                continue
+
+            if result.returncode != 0 and not output:
+                return "", stderr or f"Exit code {result.returncode}", model, rejected
+
+            return output, "", model, rejected
+
+        except subprocess.TimeoutExpired:
+            rejected.append(f"{model} (timed out)")
+            last_error = "Gemini review timed out after 10 minutes."
+            continue
+        except FileNotFoundError:
+            return "", "gemini CLI not found. Install via: npm install -g @google/gemini-cli", "", rejected
+        except Exception as e:
+            return "", str(e), "", rejected
+
+    return "", last_error, "", rejected
 
 
 def describe_subject(mode: str, param: str) -> str:
@@ -202,21 +237,31 @@ def write_committee_review(
     codex_error: str,
     gemini_output: str,
     gemini_error: str,
+    gemini_model: str,
+    gemini_rejected: list[str],
     mode: str,
     param: str,
 ) -> str:
     """Write COMMITTEE_REVIEW.md and return its path."""
     subject = describe_subject(mode, param)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    gemini_label = gemini_model or "unavailable"
 
     codex_section = codex_output if codex_output else f"> Review unavailable.\n> Error: {codex_error}"
     gemini_section = gemini_output if gemini_output else f"> Review unavailable.\n> Error: {gemini_error}"
+
+    # Build cascade info
+    cascade_info = ""
+    if gemini_rejected:
+        cascade_info += f"\n**Models tried:** {' → '.join(r for r in gemini_rejected)} → **{gemini_label}**"
+    if gemini_rejected:
+        cascade_info += f"\n**Rejected:** {', '.join(gemini_rejected)}"
 
     content = f"""# Committee Review Report
 
 **Subject:** {subject}
 **Date:** {timestamp}
-**Panel:** GPT-5.4 (Codex CLI) · Gemini-3.1-Pro-Preview (Gemini CLI)
+**Panel:** GPT-5.4 (Codex CLI) · {gemini_label} (Gemini CLI)
 
 ---
 
@@ -226,7 +271,8 @@ def write_committee_review(
 
 ---
 
-## Gemini Review (Gemini-3.1-Pro-Preview)
+## Gemini Review ({gemini_label})
+{cascade_info}
 
 {gemini_section}
 
@@ -287,7 +333,7 @@ def main():
 
     subject = describe_subject(args.mode, args.param)
     print(f"Committee Review: {subject}")
-    print("Running Codex (gpt-5.4) and Gemini (gemini-3.1-pro-preview) in parallel...")
+    print("Running Codex (gpt-5.4) and Gemini (cascade: %s) in parallel..." % " → ".join(GEMINI_MODELS))
     print()
 
     # Get diff content — resolved relative to project_dir
@@ -303,16 +349,20 @@ def main():
         for future in as_completed([codex_future, gemini_future]):
             if future is codex_future:
                 label = "Codex"
+                _, err = future.result()
             else:
                 label = "Gemini"
-            _, err = future.result()
+                _, err, _, _ = future.result()
             if err:
                 print(f"  {label}: error - {err}")
             else:
                 print(f"  {label}: done")
 
     codex_output, codex_error = codex_future.result()
-    gemini_output, gemini_error = gemini_future.result()
+    gemini_output, gemini_error, gemini_model, gemini_rejected = gemini_future.result()
+
+    if gemini_model:
+        print(f"  Gemini model used: {gemini_model}")
 
     output_path = write_committee_review(
         args.output_dir,
@@ -320,6 +370,8 @@ def main():
         codex_error,
         gemini_output,
         gemini_error,
+        gemini_model,
+        gemini_rejected,
         args.mode,
         args.param,
     )
