@@ -178,7 +178,6 @@ def run_gemini_review(diff_content: str, project_dir: str = ".") -> tuple[str, s
                     "-m", model,
                     "-p", GEMINI_REVIEW_PROMPT,
                     "--approval-mode", "plan",
-                    "--sandbox",
                     "--output-format", "text",
                 ],
                 input=diff_content,
