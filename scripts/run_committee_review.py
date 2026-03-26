@@ -99,53 +99,87 @@ def get_git_diff(mode: str, param: str, project_dir: str = ".") -> str:
     return ""
 
 
-def run_codex_review(mode: str, param: str, file_content: str = "", project_dir: str = ".") -> tuple[str, str]:
-    """Run codex review. Returns (output, error_msg).
+CODEX_MODELS = [
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5.2",
+]
 
-    For git-based modes (uncommitted/base/commit), uses native codex review flags.
-    For files mode, pipes the file content as the review prompt via stdin.
+
+def run_codex_review(mode: str, param: str, file_content: str = "", project_dir: str = ".", focus: str = "") -> tuple[str, str, str, list[str]]:
+    """Run codex review with model cascade fallback.
+
+    Returns (output, error_msg, model_used, rejected_models).
+    Tries models in order, falling back on stream disconnects or rate limits.
     """
-    try:
-        if mode == "files":
-            # codex review doesn't have a --files flag; pipe content as the prompt via stdin
-            if not file_content.strip():
-                return "", "No file content to review."
-            prompt = (
-                "Please review the following source files for bugs, design issues, "
-                "and improvements. Provide structured feedback with sections: "
-                "Strengths, Critical Issues, Important Issues, Minor Issues, Overall Assessment.\n\n"
-                + file_content
-            )
-            result = subprocess.run(
-                ["codex", "review", "-c", 'model="gpt-5.4"', "-"],
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=600,
-                cwd=project_dir,
-            )
-        else:
-            cmd = ["codex", "review", "-c", 'model="gpt-5.4"']
-            if mode == "uncommitted":
-                cmd.append("--uncommitted")
-            elif mode == "base":
-                cmd.extend(["--base", param])
-            elif mode == "commit":
-                cmd.extend(["--commit", param])
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=project_dir)
+    focus_suffix = f"\n\nFocus especially on: {focus}" if focus else ""
+    rejected = []
+    last_error = ""
 
-        output = result.stdout.strip()
-        if result.returncode != 0 and not output:
-            return "", result.stderr.strip() or f"Exit code {result.returncode}"
-        if result.stderr.strip():
-            output = output + "\n" + result.stderr.strip() if output else result.stderr.strip()
-        return output, ""
-    except subprocess.TimeoutExpired:
-        return "", "Codex review timed out after 10 minutes. Try a smaller set of files."
-    except FileNotFoundError:
-        return "", "codex CLI not found. Install via: npm install -g @openai/codex"
-    except Exception as e:
-        return "", str(e)
+    for model in CODEX_MODELS:
+        try:
+            if mode == "files":
+                if not file_content.strip():
+                    return "", "No file content to review.", "", []
+                prompt = (
+                    "Please review the following source files for bugs, design issues, "
+                    "and improvements. Provide structured feedback with sections: "
+                    "Strengths, Critical Issues, Important Issues, Minor Issues, Overall Assessment."
+                    + focus_suffix + "\n\n"
+                    + file_content
+                )
+                result = subprocess.run(
+                    ["codex", "review", "-c", f'model="{model}"', "-"],
+                    input=prompt,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                    cwd=project_dir,
+                )
+            else:
+                cmd = ["codex", "review", "-c", f'model="{model}"']
+                if mode == "uncommitted":
+                    cmd.append("--uncommitted")
+                elif mode == "base":
+                    cmd.extend(["--base", param])
+                elif mode == "commit":
+                    cmd.extend(["--commit", param])
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=project_dir)
+
+            output = result.stdout.strip()
+            stderr = result.stderr.strip()
+
+            is_retriable = any(s in stderr for s in [
+                "429", "stream disconnected", "RESOURCE_EXHAUSTED",
+                "rate limit", "Reconnecting",
+            ])
+
+            if result.returncode != 0 and not output and is_retriable:
+                reason = "rate-limited" if "429" in stderr or "rate limit" in stderr else "unavailable"
+                rejected.append(f"{model} ({reason})")
+                last_error = stderr or f"Exit code {result.returncode}"
+                print(f"  Codex: {model} {reason}, falling back...")
+                continue
+
+            if result.returncode != 0 and not output:
+                return "", stderr or f"Exit code {result.returncode}", model, rejected
+
+            if stderr:
+                output = output + "\n" + stderr if output else stderr
+            return output, "", model, rejected
+
+        except subprocess.TimeoutExpired:
+            rejected.append(f"{model} (timed out)")
+            last_error = "Codex review timed out after 10 minutes."
+            continue
+        except FileNotFoundError:
+            return "", "codex CLI not found. Install via: npm install -g @openai/codex", "", rejected
+        except Exception as e:
+            return "", str(e), "", rejected
+
+    return "", last_error, "", rejected
 
 
 GEMINI_MODELS = [
@@ -157,15 +191,19 @@ GEMINI_MODELS = [
 ]
 
 
-def run_gemini_review(diff_content: str, project_dir: str = ".") -> tuple[str, str, str, list[str]]:
+def run_gemini_review(diff_content: str, project_dir: str = ".", focus: str = "") -> tuple[str, str, str, list[str]]:
     """Run gemini review with model cascade fallback.
 
     Returns (output, error_msg, model_used, rejected_models).
     Tries models in order, falling back on rate limit (429) or model-not-found (404).
-    Uses --approval-mode plan (read-only) and --sandbox for isolation.
+    Uses --approval-mode plan (read-only).
     """
     if not diff_content.strip():
         return "", "No diff content to review.", "", []
+
+    prompt = GEMINI_REVIEW_PROMPT
+    if focus:
+        prompt += f"\n\nFocus especially on: {focus}\n"
 
     rejected = []
     last_error = ""
@@ -176,7 +214,7 @@ def run_gemini_review(diff_content: str, project_dir: str = ".") -> tuple[str, s
                 [
                     "gemini",
                     "-m", model,
-                    "-p", GEMINI_REVIEW_PROMPT,
+                    "-p", prompt,
                     "--approval-mode", "plan",
                     "--output-format", "text",
                 ],
@@ -230,10 +268,22 @@ def describe_subject(mode: str, param: str) -> str:
     return "Code review"
 
 
+def _cascade_info(model: str, rejected: list[str]) -> str:
+    """Build cascade info string for the report."""
+    if not rejected:
+        return ""
+    return (
+        f"\n**Models tried:** {' → '.join(rejected)} → **{model}**"
+        f"\n**Rejected:** {', '.join(rejected)}"
+    )
+
+
 def write_committee_review(
     output_dir: str,
     codex_output: str,
     codex_error: str,
+    codex_model: str,
+    codex_rejected: list[str],
     gemini_output: str,
     gemini_error: str,
     gemini_model: str,
@@ -244,34 +294,32 @@ def write_committee_review(
     """Write COMMITTEE_REVIEW.md and return its path."""
     subject = describe_subject(mode, param)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    codex_label = codex_model or "unavailable"
     gemini_label = gemini_model or "unavailable"
 
     codex_section = codex_output if codex_output else f"> Review unavailable.\n> Error: {codex_error}"
     gemini_section = gemini_output if gemini_output else f"> Review unavailable.\n> Error: {gemini_error}"
 
-    # Build cascade info
-    cascade_info = ""
-    if gemini_rejected:
-        cascade_info += f"\n**Models tried:** {' → '.join(r for r in gemini_rejected)} → **{gemini_label}**"
-    if gemini_rejected:
-        cascade_info += f"\n**Rejected:** {', '.join(gemini_rejected)}"
+    codex_cascade = _cascade_info(codex_label, codex_rejected)
+    gemini_cascade = _cascade_info(gemini_label, gemini_rejected)
 
     content = f"""# Committee Review Report
 
 **Subject:** {subject}
 **Date:** {timestamp}
-**Panel:** GPT-5.4 (Codex CLI) · {gemini_label} (Gemini CLI)
+**Panel:** {codex_label} (Codex CLI) · {gemini_label} (Gemini CLI)
 
 ---
 
-## Codex Review (GPT-5.4)
+## Codex Review ({codex_label})
+{codex_cascade}
 
 {codex_section}
 
 ---
 
 ## Gemini Review ({gemini_label})
-{cascade_info}
+{gemini_cascade}
 
 {gemini_section}
 
@@ -324,6 +372,11 @@ def main():
         default=".",
         help="Root of the project to review — CLIs run with this as cwd so they pick up the right context (default: current directory)",
     )
+    parser.add_argument(
+        "--focus",
+        default="",
+        help="Additional focus area for the review (e.g. 'security', 'performance', 'error handling')",
+    )
     args = parser.parse_args()
 
     # Default output-dir to project-dir so COMMITTEE_REVIEW.md lands in the repo
@@ -332,7 +385,8 @@ def main():
 
     subject = describe_subject(args.mode, args.param)
     print(f"Committee Review: {subject}")
-    print("Running Codex (gpt-5.4) and Gemini (cascade: %s) in parallel..." % " → ".join(GEMINI_MODELS))
+    print("Running Codex (cascade: %s) and Gemini (cascade: %s) in parallel..." % (
+        " → ".join(CODEX_MODELS), " → ".join(GEMINI_MODELS)))
     print()
 
     # Get diff content — resolved relative to project_dir
@@ -342,24 +396,25 @@ def main():
         print("Continuing anyway — reviewers will report empty input.")
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        codex_future = executor.submit(run_codex_review, args.mode, args.param, diff_content, args.project_dir)
-        gemini_future = executor.submit(run_gemini_review, diff_content, args.project_dir)
+        codex_future = executor.submit(run_codex_review, args.mode, args.param, diff_content, args.project_dir, args.focus)
+        gemini_future = executor.submit(run_gemini_review, diff_content, args.project_dir, args.focus)
 
         for future in as_completed([codex_future, gemini_future]):
             if future is codex_future:
                 label = "Codex"
-                _, err = future.result()
             else:
                 label = "Gemini"
-                _, err, _, _ = future.result()
+            _, err, _, _ = future.result()
             if err:
                 print(f"  {label}: error - {err}")
             else:
                 print(f"  {label}: done")
 
-    codex_output, codex_error = codex_future.result()
+    codex_output, codex_error, codex_model, codex_rejected = codex_future.result()
     gemini_output, gemini_error, gemini_model, gemini_rejected = gemini_future.result()
 
+    if codex_model:
+        print(f"  Codex model used: {codex_model}")
     if gemini_model:
         print(f"  Gemini model used: {gemini_model}")
 
@@ -367,6 +422,8 @@ def main():
         args.output_dir,
         codex_output,
         codex_error,
+        codex_model,
+        codex_rejected,
         gemini_output,
         gemini_error,
         gemini_model,
