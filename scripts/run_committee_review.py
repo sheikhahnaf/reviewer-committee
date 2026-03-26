@@ -85,12 +85,17 @@ def get_git_diff(mode: str, param: str, project_dir: str = ".") -> str:
         elif mode == "files":
             content = ""
             for filepath in param.split():
-                # Resolve relative to project_dir
-                p = (project_path / filepath) if not Path(filepath).is_absolute() else Path(filepath)
-                if p.exists():
-                    content += f"\n### {filepath}\n```\n{p.read_text()}\n```\n"
-                else:
+                p = (project_path / filepath).resolve()
+                # Reject paths that escape the project directory
+                if not str(p).startswith(str(project_path)):
+                    content += f"\n### {filepath}\n(rejected: path escapes project directory)\n"
+                elif not p.exists():
                     content += f"\n### {filepath}\n(file not found: {p})\n"
+                else:
+                    try:
+                        content += f"\n### {filepath}\n```\n{p.read_text()}\n```\n"
+                    except UnicodeDecodeError:
+                        content += f"\n### {filepath}\n(skipped: binary file)\n"
             return content
 
     except Exception as e:
