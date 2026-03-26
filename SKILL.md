@@ -51,7 +51,7 @@ python "$REVIEWER_COMMITTEE_DIR/scripts/run_committee_review.py" \
 ```
 
 `COMMITTEE_REVIEW.md` is written to `--project-dir` by default (or `--output-dir` if specified).
-Gemini runs with `--sandbox` for isolation.
+Gemini runs with `--approval-mode plan` (read-only) and `--sandbox` for isolation.
 
 ## After the Script Completes
 

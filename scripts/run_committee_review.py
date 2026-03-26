@@ -162,7 +162,8 @@ def run_gemini_review(diff_content: str, project_dir: str = ".") -> tuple[str, s
                 "gemini",
                 "-m", "gemini-3.1-pro-preview",
                 "-p", GEMINI_REVIEW_PROMPT,
-                "--sandbox",                 # sandbox isolation
+                "--approval-mode", "plan",   # read-only: cannot edit or execute
+                "--sandbox",                 # additional sandbox isolation
                 "--output-format", "text",
             ],
             input=diff_content,
