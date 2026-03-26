@@ -99,12 +99,13 @@ def get_git_diff(mode: str, param: str, project_dir: str = ".") -> str:
     return ""
 
 
-def run_codex_review(mode: str, param: str, file_content: str = "", project_dir: str = ".") -> tuple[str, str]:
+def run_codex_review(mode: str, param: str, file_content: str = "", project_dir: str = ".", focus: str = "") -> tuple[str, str]:
     """Run codex review. Returns (output, error_msg).
 
     For git-based modes (uncommitted/base/commit), uses native codex review flags.
     For files mode, pipes the file content as the review prompt via stdin.
     """
+    focus_suffix = f"\n\nFocus especially on: {focus}" if focus else ""
     try:
         if mode == "files":
             # codex review doesn't have a --files flag; pipe content as the prompt via stdin
@@ -113,7 +114,8 @@ def run_codex_review(mode: str, param: str, file_content: str = "", project_dir:
             prompt = (
                 "Please review the following source files for bugs, design issues, "
                 "and improvements. Provide structured feedback with sections: "
-                "Strengths, Critical Issues, Important Issues, Minor Issues, Overall Assessment.\n\n"
+                "Strengths, Critical Issues, Important Issues, Minor Issues, Overall Assessment."
+                + focus_suffix + "\n\n"
                 + file_content
             )
             result = subprocess.run(
@@ -157,15 +159,19 @@ GEMINI_MODELS = [
 ]
 
 
-def run_gemini_review(diff_content: str, project_dir: str = ".") -> tuple[str, str, str, list[str]]:
+def run_gemini_review(diff_content: str, project_dir: str = ".", focus: str = "") -> tuple[str, str, str, list[str]]:
     """Run gemini review with model cascade fallback.
 
     Returns (output, error_msg, model_used, rejected_models).
     Tries models in order, falling back on rate limit (429) or model-not-found (404).
-    Uses --approval-mode plan (read-only) and --sandbox for isolation.
+    Uses --approval-mode plan (read-only).
     """
     if not diff_content.strip():
         return "", "No diff content to review.", "", []
+
+    prompt = GEMINI_REVIEW_PROMPT
+    if focus:
+        prompt += f"\n\nFocus especially on: {focus}\n"
 
     rejected = []
     last_error = ""
@@ -176,7 +182,7 @@ def run_gemini_review(diff_content: str, project_dir: str = ".") -> tuple[str, s
                 [
                     "gemini",
                     "-m", model,
-                    "-p", GEMINI_REVIEW_PROMPT,
+                    "-p", prompt,
                     "--approval-mode", "plan",
                     "--output-format", "text",
                 ],
@@ -324,6 +330,11 @@ def main():
         default=".",
         help="Root of the project to review — CLIs run with this as cwd so they pick up the right context (default: current directory)",
     )
+    parser.add_argument(
+        "--focus",
+        default="",
+        help="Additional focus area for the review (e.g. 'security', 'performance', 'error handling')",
+    )
     args = parser.parse_args()
 
     # Default output-dir to project-dir so COMMITTEE_REVIEW.md lands in the repo
@@ -342,8 +353,8 @@ def main():
         print("Continuing anyway — reviewers will report empty input.")
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        codex_future = executor.submit(run_codex_review, args.mode, args.param, diff_content, args.project_dir)
-        gemini_future = executor.submit(run_gemini_review, diff_content, args.project_dir)
+        codex_future = executor.submit(run_codex_review, args.mode, args.param, diff_content, args.project_dir, args.focus)
+        gemini_future = executor.submit(run_gemini_review, diff_content, args.project_dir, args.focus)
 
         for future in as_completed([codex_future, gemini_future]):
             if future is codex_future:
